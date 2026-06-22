@@ -79,7 +79,14 @@ serve(async (req) => {
     // --- downgrade / cancel-at-period-end ---
     if (body.changeType === "downgrade") {
       // Stop renewal; the user keeps Premium until current_period_end, then drops.
-      const s = await stripe.subscriptions.update(stripeSubId, { cancel_at_period_end: true })
+      // Tag the Stripe SUBSCRIPTION so the webhook applies the pending plan at period
+      // end instead of a plain cancellation. Gated on newPlanId so we never write the
+      // string 'undefined' for a cancel-to-Free with no target plan.
+      const stripeUpdate: Record<string, unknown> = { cancel_at_period_end: true }
+      if (body.newPlanId) {
+        stripeUpdate.metadata = { pendingPlanId: String(body.newPlanId), changeType: "downgrade" }
+      }
+      const s = await stripe.subscriptions.update(stripeSubId, stripeUpdate)
 
       const update: Record<string, unknown> = {
         cancel_at_period_end: true,

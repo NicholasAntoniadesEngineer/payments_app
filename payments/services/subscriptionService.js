@@ -416,7 +416,7 @@ const SubscriptionService = {
                         console.log('[SubscriptionService] Free plan found:', freePlan.id);
 
                         // Downgrade to Free plan
-                        const downgradeResult = await this.updateSubscription(currentUser.id, {
+                        const downgradeResult = await this.updateSubscription(userId, {
                             plan_id: freePlan.id,
                             status: 'active',
                             trial_end: null,

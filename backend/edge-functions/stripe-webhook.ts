@@ -247,10 +247,10 @@ async function handleCheckoutSessionCompleted(session: any) {
   console.log("[stripe-webhook] Handling checkout.session.completed...")
   
   try {
-    const userId = session.metadata?.userId
+    const userId = session.metadata?.supabase_user_id
     const customerId = session.customer
     const subscriptionId = session.subscription
-    const planId = session.metadata?.planId
+    const planId = session.metadata?.plan_id
 
     if (!userId) {
       console.warn("[stripe-webhook] ⚠️ No userId in session metadata")
@@ -402,7 +402,7 @@ async function handleSubscriptionUpdated(subscription: any) {
 
     // Get customer to find userId
     const customer = await stripe.customers.retrieve(customerId)
-    const userId = customer.metadata?.userId
+    const userId = customer.metadata?.supabase_user_id
 
     if (!userId) {
       console.warn("[stripe-webhook] ⚠️ No userId in customer metadata")
@@ -502,7 +502,7 @@ async function handleSubscriptionDeleted(subscription: any) {
   try {
     const customerId = subscription.customer
     const customer = await stripe.customers.retrieve(customerId)
-    const userId = customer.metadata?.userId
+    const userId = customer.metadata?.supabase_user_id
 
     if (!userId) {
       return { success: false, error: "No userId in customer metadata" }
@@ -633,7 +633,7 @@ async function handleInvoicePaymentSucceeded(invoice: any) {
 
     // Get customer to find userId
     const customer = await stripe.customers.retrieve(customerId)
-    const userId = customer.metadata?.userId
+    const userId = customer.metadata?.supabase_user_id
 
     if (!userId) {
       return { success: false, error: "No userId in customer metadata" }
@@ -712,7 +712,7 @@ async function handleInvoicePaymentFailed(invoice: any) {
   try {
     const customerId = invoice.customer
     const customer = await stripe.customers.retrieve(customerId)
-    const userId = customer.metadata?.userId
+    const userId = customer.metadata?.supabase_user_id
 
     if (!userId) {
       return { success: false, error: "No userId in customer metadata" }

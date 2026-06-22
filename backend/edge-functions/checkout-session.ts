@@ -145,6 +145,15 @@ serve(async (req) => {
         supabase_user_id: user.id,
         plan_id: premiumPlan.id.toString(),
       },
+      // Propagate identity onto the Stripe SUBSCRIPTION object too, so subscription
+      // lifecycle events (updated/deleted/invoice) can resolve the user even if the
+      // customer metadata is ever missing. Keys match the webhook's snake_case reads.
+      subscription_data: {
+        metadata: {
+          supabase_user_id: user.id,
+          plan_id: premiumPlan.id.toString(),
+        },
+      },
     })
 
     console.log("[checkout-session] ✓ Checkout session created:", session.id)
