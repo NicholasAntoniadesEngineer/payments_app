@@ -192,6 +192,31 @@ CREATE POLICY payment_history_select_own ON payment_history
 GRANT SELECT ON payment_history TO authenticated;
 GRANT USAGE, SELECT ON SEQUENCE payment_history_id_seq TO authenticated;
 
+-- ============================================================
+-- STRIPE WEBHOOK EVENTS (idempotency / event de-duplication)
+-- ============================================================
+-- The stripe-webhook records every received event id here BEFORE processing it,
+-- via an atomic INSERT ... ON CONFLICT (stripe_event_id) DO NOTHING using the
+-- service role. The insert itself is the lock: if a row already existed the
+-- webhook short-circuits with 200 and skips reprocessing (Stripe retries deliver
+-- the same event id, so this makes handling idempotent). After successful
+-- handling the webhook sets processed = true.
+--
+-- Intentionally MINIMAL: only the event id, type, a processed flag and a
+-- timestamp. The full event payload is NOT stored (avoids persisting PII).
+-- Service-role only: RLS is enabled and NO grants are issued to `authenticated`
+-- (the webhook runs as the service role, which bypasses RLS).
+CREATE TABLE IF NOT EXISTS stripe_webhook_events (
+    stripe_event_id TEXT PRIMARY KEY,
+    type TEXT,
+    processed BOOLEAN NOT NULL DEFAULT false,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+ALTER TABLE stripe_webhook_events ENABLE ROW LEVEL SECURITY;
+-- No policies and no grants to `authenticated`: only the service role (which
+-- bypasses RLS) may read/write this table.
+
 -- Populate subscription plans (rebranded for Secure Messenger).
 -- Set stripe_price_id to your real Stripe price IDs to enable paid upgrades.
 INSERT INTO subscription_plans (name, description, stripe_price_id, price_cents, interval, features, is_active)

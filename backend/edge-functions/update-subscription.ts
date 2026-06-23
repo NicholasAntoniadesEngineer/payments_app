@@ -26,27 +26,42 @@ const stripe = new Stripe(stripeKey, { apiVersion: "2023-10-16" })
 const supabaseUrl = Deno.env.get("SUPABASE_URL")
 const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")
 
-const cors = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+// CORS allowlist (EB-10): reflect the request Origin back in ACAO only if it is
+// in the allowlist, otherwise fall back to the GitHub Pages origin. Never echo
+// an arbitrary Origin with `*`.
+const GITHUB_PAGES_ORIGIN = "https://nicholasantoniadesengineer.github.io"
+const ALLOWED_ORIGINS = new Set([
+  GITHUB_PAGES_ORIGIN,
+  "http://localhost",
+  "http://127.0.0.1",
+])
+function corsHeaders(req: Request): Record<string, string> {
+  const origin = req.headers.get("Origin") ?? ""
+  return {
+    "Access-Control-Allow-Origin": ALLOWED_ORIGINS.has(origin) ? origin : GITHUB_PAGES_ORIGIN,
+    "Vary": "Origin",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  }
 }
-const json = (b: unknown, s: number) =>
+const json = (b: unknown, s: number, cors: Record<string, string>) =>
   new Response(JSON.stringify(b), { status: s, headers: { ...cors, "Content-Type": "application/json" } })
 
 serve(async (req) => {
+  const cors = corsHeaders(req)
+
   if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: cors })
-  if (req.method !== "POST") return json({ error: "Method not allowed" }, 405)
-  if (!supabaseUrl || !serviceRoleKey) return json({ error: "Server configuration error" }, 500)
+  if (req.method !== "POST") return json({ error: "Method not allowed" }, 405, cors)
+  if (!supabaseUrl || !serviceRoleKey) return json({ error: "Server configuration error" }, 500, cors)
 
   try {
     const authHeader = req.headers.get("Authorization") ?? ""
     const jwt = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : ""
-    if (!jwt) return json({ error: "Missing authorization header" }, 401)
+    if (!jwt) return json({ error: "Missing authorization header" }, 401, cors)
 
     const supabase = createClient(supabaseUrl, serviceRoleKey, { auth: { persistSession: false } })
     const { data: { user }, error: authError } = await supabase.auth.getUser(jwt)
-    if (authError || !user) return json({ error: "Invalid or expired token" }, 401)
+    if (authError || !user) return json({ error: "Invalid or expired token" }, 401, cors)
 
     const body = await req.json().catch(() => ({}))
 
@@ -56,12 +71,12 @@ serve(async (req) => {
       .select("id, stripe_subscription_id, stripe_customer_id, current_period_end, plan_id")
       .eq("user_id", user.id)
       .single()
-    if (subErr || !sub) return json({ error: "Subscription not found" }, 404)
+    if (subErr || !sub) return json({ error: "Subscription not found" }, 404, cors)
 
     const stripeSubId = sub.stripe_subscription_id
     if (!stripeSubId) {
       // No active Stripe subscription (free/trial) — nothing to change at Stripe.
-      return json({ success: true, note: "no_stripe_subscription" }, 200)
+      return json({ success: true, note: "no_stripe_subscription" }, 200, cors)
     }
 
     // --- syncDates: pull authoritative dates/status from Stripe ---
@@ -73,7 +88,7 @@ serve(async (req) => {
         current_period_end: new Date(s.current_period_end * 1000).toISOString(),
         cancel_at_period_end: s.cancel_at_period_end,
       }).eq("user_id", user.id)
-      return json({ success: true, synced: true }, 200)
+      return json({ success: true, synced: true }, 200, cors)
     }
 
     // --- downgrade / cancel-at-period-end ---
@@ -98,12 +113,12 @@ serve(async (req) => {
         update.pending_change_at = new Date(s.current_period_end * 1000).toISOString()
       }
       await supabase.from("subscriptions").update(update).eq("user_id", user.id)
-      return json({ success: true, cancel_at_period_end: true, effective_at: update.current_period_end }, 200)
+      return json({ success: true, cancel_at_period_end: true, effective_at: update.current_period_end }, 200, cors)
     }
 
-    return json({ error: "Unsupported changeType" }, 400)
+    return json({ error: "Unsupported changeType" }, 400, cors)
   } catch (error) {
     console.error("[update-subscription] error:", (error as Error).message)
-    return json({ error: "Failed to update subscription" }, 500)
+    return json({ error: "Failed to update subscription" }, 500, cors)
   }
 })

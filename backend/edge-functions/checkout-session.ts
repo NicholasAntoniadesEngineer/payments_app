@@ -39,12 +39,25 @@ const ALLOWED_RETURN_ORIGINS = [
   "http://127.0.0.1",
 ]
 
-const cors = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+// CORS allowlist (EB-10): reflect the request Origin back in ACAO only if it is
+// in the allowlist, otherwise fall back to the GitHub Pages origin. Never echo
+// an arbitrary Origin with `*`.
+const GITHUB_PAGES_ORIGIN = "https://nicholasantoniadesengineer.github.io"
+const ALLOWED_ORIGINS = new Set([
+  GITHUB_PAGES_ORIGIN,
+  "http://localhost",
+  "http://127.0.0.1",
+])
+function corsHeaders(req: Request): Record<string, string> {
+  const origin = req.headers.get("Origin") ?? ""
+  return {
+    "Access-Control-Allow-Origin": ALLOWED_ORIGINS.has(origin) ? origin : GITHUB_PAGES_ORIGIN,
+    "Vary": "Origin",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  }
 }
-const json = (body: unknown, status: number) =>
+const json = (body: unknown, status: number, cors: Record<string, string>) =>
   new Response(JSON.stringify(body), { status, headers: { ...cors, "Content-Type": "application/json" } })
 
 function isAllowedReturnUrl(url: string): boolean {
@@ -60,31 +73,33 @@ function isAllowedReturnUrl(url: string): boolean {
 }
 
 serve(async (req) => {
+  const cors = corsHeaders(req)
+
   // CORS
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: cors })
   }
 
   if (req.method !== "POST") {
-    return json({ error: "Method not allowed" }, 405)
+    return json({ error: "Method not allowed" }, 405, cors)
   }
 
   // Identity from the verified token ONLY. Reject missing/invalid auth as 401
   // and bad input as 400 BEFORE entering the try (generic 500 in catch only).
   const authHeader = req.headers.get("Authorization") ?? ""
   const jwt = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : ""
-  if (!jwt) return json({ error: "Missing authorization header" }, 401)
+  if (!jwt) return json({ error: "Missing authorization header" }, 401, cors)
 
   const supabase = createClient(supabaseUrl, supabaseServiceKey, { auth: { persistSession: false } })
   const { data: { user }, error: authError } = await supabase.auth.getUser(jwt)
-  if (authError || !user) return json({ error: "Invalid or expired token" }, 401)
+  if (authError || !user) return json({ error: "Invalid or expired token" }, 401, cors)
 
   const { successUrl, cancelUrl } = await req.json().catch(() => ({}))
   if (!successUrl || typeof successUrl !== "string" || !isAllowedReturnUrl(successUrl)) {
-    return json({ error: "Invalid successUrl" }, 400)
+    return json({ error: "Invalid successUrl" }, 400, cors)
   }
   if (!cancelUrl || typeof cancelUrl !== "string" || !isAllowedReturnUrl(cancelUrl)) {
-    return json({ error: "Invalid cancelUrl" }, 400)
+    return json({ error: "Invalid cancelUrl" }, 400, cors)
   }
 
   try {
@@ -169,10 +184,10 @@ serve(async (req) => {
 
     console.log("[checkout-session] ✓ Checkout session created:", session.id)
 
-    return json({ url: session.url, session_id: session.id }, 200)
+    return json({ url: session.url, session_id: session.id }, 200, cors)
 
   } catch (error) {
     console.error("[checkout-session] error:", (error as Error).message)
-    return json({ error: "Failed to create checkout session" }, 500)
+    return json({ error: "Failed to create checkout session" }, 500, cors)
   }
 })

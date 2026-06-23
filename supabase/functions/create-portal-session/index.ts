@@ -37,12 +37,25 @@ const ALLOWED_RETURN_ORIGINS = [
   "http://127.0.0.1",
 ]
 
-const cors = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+// CORS allowlist (EB-10): reflect the request Origin back in ACAO only if it is
+// in the allowlist, otherwise fall back to the GitHub Pages origin. Never echo
+// an arbitrary Origin with `*`.
+const GITHUB_PAGES_ORIGIN = "https://nicholasantoniadesengineer.github.io"
+const ALLOWED_ORIGINS = new Set([
+  GITHUB_PAGES_ORIGIN,
+  "http://localhost",
+  "http://127.0.0.1",
+])
+function corsHeaders(req: Request): Record<string, string> {
+  const origin = req.headers.get("Origin") ?? ""
+  return {
+    "Access-Control-Allow-Origin": ALLOWED_ORIGINS.has(origin) ? origin : GITHUB_PAGES_ORIGIN,
+    "Vary": "Origin",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  }
 }
-const json = (body: unknown, status: number) =>
+const json = (body: unknown, status: number, cors: Record<string, string>) =>
   new Response(JSON.stringify(body), { status, headers: { ...cors, "Content-Type": "application/json" } })
 
 function isAllowedReturnUrl(url: string): boolean {
@@ -58,23 +71,25 @@ function isAllowedReturnUrl(url: string): boolean {
 }
 
 serve(async (req) => {
+  const cors = corsHeaders(req)
+
   if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: cors })
-  if (req.method !== "POST") return json({ error: "Method not allowed" }, 405)
-  if (!supabaseUrl || !serviceRoleKey) return json({ error: "Server configuration error" }, 500)
+  if (req.method !== "POST") return json({ error: "Method not allowed" }, 405, cors)
+  if (!supabaseUrl || !serviceRoleKey) return json({ error: "Server configuration error" }, 500, cors)
 
   try {
     // Identity from the verified token ONLY.
     const authHeader = req.headers.get("Authorization") ?? ""
     const jwt = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : ""
-    if (!jwt) return json({ error: "Missing authorization header" }, 401)
+    if (!jwt) return json({ error: "Missing authorization header" }, 401, cors)
 
     const supabase = createClient(supabaseUrl, serviceRoleKey, { auth: { persistSession: false } })
     const { data: { user }, error: authError } = await supabase.auth.getUser(jwt)
-    if (authError || !user) return json({ error: "Invalid or expired token" }, 401)
+    if (authError || !user) return json({ error: "Invalid or expired token" }, 401, cors)
 
     const { returnUrl } = await req.json().catch(() => ({}))
     if (!returnUrl || typeof returnUrl !== "string" || !isAllowedReturnUrl(returnUrl)) {
-      return json({ error: "Invalid returnUrl" }, 400)
+      return json({ error: "Invalid returnUrl" }, 400, cors)
     }
 
     // The Stripe customer is ALWAYS the caller's own — never from the body.
@@ -85,15 +100,15 @@ serve(async (req) => {
       .single()
 
     const customerId = sub?.stripe_customer_id
-    if (!customerId) return json({ error: "No billing account found" }, 404)
+    if (!customerId) return json({ error: "No billing account found" }, 404, cors)
 
     const session = await stripe.billingPortal.sessions.create({
       customer: customerId,
       return_url: returnUrl,
     })
-    return json({ url: session.url }, 200)
+    return json({ url: session.url }, 200, cors)
   } catch (error) {
     console.error("[create-portal-session] error:", (error as Error).message)
-    return json({ error: "Failed to create portal session" }, 500)
+    return json({ error: "Failed to create portal session" }, 500, cors)
   }
 })

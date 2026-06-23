@@ -1792,7 +1792,22 @@ const UpgradeController = {
             console.log('[UpgradeController] Status class mapped:', { input: status, output: mappedClass });
             return mappedClass;
         };
-        
+
+        // FE-04: invoice fields are Stripe-sourced strings interpolated into
+        // innerHTML, so they MUST be HTML-escaped to prevent XSS.
+        const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({
+            '&': '&amp;',
+            '<': '&lt;',
+            '>': '&gt;',
+            '"': '&quot;',
+            "'": '&#39;'
+        })[ch]);
+
+        // Only emit an href if it is an https:// URL; otherwise drop it (guards
+        // against javascript: / data: and other unsafe schemes). The result is
+        // still attribute-escaped before being placed in the markup.
+        const safeHttpsUrl = (url) => (typeof url === 'string' && /^https:\/\//i.test(url)) ? url : '';
+
         console.log('[UpgradeController] Generating HTML for invoices...');
         const invoiceHTMLParts = invoices.map((invoice, index) => {
             console.log(`[UpgradeController] Processing invoice ${index + 1}/${invoices.length}:`, {
@@ -1807,25 +1822,28 @@ const UpgradeController = {
             const formattedDate = formatDate(invoice.created);
             const formattedAmount = formatCurrency(invoice.amount_paid, invoice.currency);
             const statusClass = getStatusClass(invoice.status);
-            
+            const invoiceLabel = escapeHtml(invoice.number || invoice.id);
+            const hostedUrl = safeHttpsUrl(invoice.hosted_invoice_url);
+            const pdfUrl = safeHttpsUrl(invoice.invoice_pdf);
+
             return `
                     <li class="invoice-item">
                         <div class="invoice-item-info">
-                            <div class="invoice-item-number">Invoice ${invoice.number || invoice.id}</div>
-                            <div class="invoice-item-date">${formattedDate}</div>
-                            <div class="invoice-item-amount">${formattedAmount}</div>
+                            <div class="invoice-item-number">Invoice ${invoiceLabel}</div>
+                            <div class="invoice-item-date">${escapeHtml(formattedDate)}</div>
+                            <div class="invoice-item-amount">${escapeHtml(formattedAmount)}</div>
                         </div>
                         <div>
-                            <span class="invoice-item-status ${statusClass}">${invoice.status}</span>
+                            <span class="invoice-item-status ${escapeHtml(statusClass)}">${escapeHtml(invoice.status)}</span>
                         </div>
                         <div class="invoice-item-actions">
-                            ${invoice.hosted_invoice_url ? `
-                                <a href="${invoice.hosted_invoice_url}" target="_blank" class="btn btn-action" style="text-decoration: none;">
+                            ${hostedUrl ? `
+                                <a href="${escapeHtml(hostedUrl)}" target="_blank" rel="noopener noreferrer" class="btn btn-action" style="text-decoration: none;">
                                     View Invoice
                                 </a>
                             ` : ''}
-                            ${invoice.invoice_pdf ? `
-                                <a href="${invoice.invoice_pdf}" target="_blank" class="btn btn-action" style="text-decoration: none;">
+                            ${pdfUrl ? `
+                                <a href="${escapeHtml(pdfUrl)}" target="_blank" rel="noopener noreferrer" class="btn btn-action" style="text-decoration: none;">
                                     Download PDF
                                 </a>
                             ` : ''}
@@ -1865,7 +1883,16 @@ const UpgradeController = {
             currentInnerHTML: body ? body.innerHTML.substring(0, 200) : 'N/A'
         });
         if (body) {
-            body.innerHTML = `<div class="invoice-error">${errorMessage}</div>`;
+            // FE-04: the error string can carry Stripe/back-end text — escape it
+            // before placing it in innerHTML to prevent XSS.
+            const safeError = String(errorMessage ?? '').replace(/[&<>"']/g, (ch) => ({
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#39;'
+            })[ch]);
+            body.innerHTML = `<div class="invoice-error">${safeError}</div>`;
             console.log('[UpgradeController] ✅ Error message displayed in modal');
             console.log('[UpgradeController] Modal body after error update:', {
                 innerHTMLLength: body.innerHTML.length,

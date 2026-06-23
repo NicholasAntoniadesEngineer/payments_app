@@ -143,8 +143,25 @@ serve(async (req) => {
       created: new Date(event.created * 1000).toISOString()
     })
 
-    // Store webhook event in database (for audit trail)
-    await storeWebhookEvent(event)
+    // Idempotency / event de-duplication (PAY-2/EB-02).
+    // The insert IS the lock: an atomic INSERT ... ON CONFLICT DO NOTHING records
+    // the event id BEFORE any handling. If the row already existed this is a
+    // redelivery of an event we have already seen, so we short-circuit with 200
+    // and skip reprocessing. NO SELECT-then-INSERT (that would be TOCTOU).
+    const inserted = await claimWebhookEvent(event)
+    if (!inserted) {
+      console.log("[stripe-webhook] ⏭️ Duplicate event, already seen — skipping:", event.id)
+      return new Response(
+        JSON.stringify({ received: true, duplicate: true }),
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+          }
+        }
+      )
+    }
 
     // Handle different event types
     let result
@@ -178,6 +195,10 @@ serve(async (req) => {
         console.log("[stripe-webhook] ⚠️ Unhandled event type:", event.type)
         result = { success: true, message: `Unhandled event type: ${event.type}` }
     }
+
+    // Mark the event as fully processed (best-effort; idempotency already holds
+    // via the unique event id even if this flag never flips).
+    await markWebhookEventProcessed(event.id)
 
     const totalElapsed = Date.now() - startTime
     console.log("[stripe-webhook] ========== WEBHOOK PROCESSED ==========")
@@ -216,37 +237,91 @@ serve(async (req) => {
 })
 
 /**
- * Store webhook event in database for audit trail
+ * Atomically claim a webhook event for processing (idempotency lock).
+ *
+ * Performs a single INSERT ... ON CONFLICT (stripe_event_id) DO NOTHING against
+ * stripe_webhook_events. The INSERT itself is the lock — there is NO
+ * SELECT-then-INSERT, so there is no TOCTOU window. PostgREST is told to ignore
+ * duplicates and to return the representation; the response body therefore
+ * contains the inserted row on a first delivery and an EMPTY array on a
+ * redelivery whose id already exists.
+ *
+ * Returns true  -> this call inserted the row (first time we've seen the event).
+ * Returns false -> the id already existed (duplicate / redelivery) -> caller
+ *                  should short-circuit with 200 and skip reprocessing.
+ *
+ * Minimal columns only (no payload/PII). On a genuine DB error we throw so the
+ * outer try/catch returns 500 and Stripe retries — we never blanket-convert a
+ * 500 into a 200, only true duplicates short-circuit.
  */
-async function storeWebhookEvent(event: any) {
-  try {
-    console.log("[stripe-webhook] Storing webhook event in database...")
-    
-    const response = await fetch(`${supabaseClient.url}/rest/v1/stripe_webhook_events`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "apikey": supabaseClient.key,
-        "Authorization": `Bearer ${supabaseClient.key}`,
-        "Prefer": "return=representation"
-      },
-      body: JSON.stringify({
-        stripe_event_id: event.id,
-        event_type: event.type,
-        event_data: event.data,
-        processed: false,
-        created_at: new Date().toISOString()
-      })
-    })
+async function claimWebhookEvent(event: any): Promise<boolean> {
+  console.log("[stripe-webhook] Claiming webhook event (idempotency insert)...")
 
+  const response = await fetch(`${supabaseClient.url}/rest/v1/stripe_webhook_events`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "apikey": supabaseClient.key,
+      "Authorization": `Bearer ${supabaseClient.key}`,
+      // ignore-duplicates: ON CONFLICT DO NOTHING; representation: return rows so
+      // we can detect whether a row was actually inserted.
+      "Prefer": "resolution=ignore-duplicates,return=representation"
+    },
+    body: JSON.stringify({
+      stripe_event_id: event.id,
+      type: event.type,
+      processed: false
+    })
+  })
+
+  // A 409 also means "already present" on some PostgREST configurations; treat
+  // it as a duplicate rather than an error.
+  if (response.status === 409) {
+    console.log("[stripe-webhook] Event already present (409) — duplicate")
+    return false
+  }
+
+  if (!response.ok) {
+    const errorText = await response.text()
+    // Genuine failure (e.g. table missing) — do NOT swallow. Throw so the outer
+    // handler returns 500 and Stripe retries. (Replaces the old 404-swallowing.)
+    throw new Error(`Failed to claim webhook event: ${response.status} ${errorText}`)
+  }
+
+  const rows = await response.json().catch(() => [])
+  const insertedNow = Array.isArray(rows) && rows.length > 0
+  console.log(insertedNow
+    ? "[stripe-webhook] ✅ Event claimed (first delivery)"
+    : "[stripe-webhook] Event already present (no row inserted) — duplicate")
+  return insertedNow
+}
+
+/**
+ * Mark a previously-claimed webhook event as fully processed.
+ * Best-effort: failure here does not break idempotency (the unique id row
+ * already prevents reprocessing) and must not fail the webhook.
+ */
+async function markWebhookEventProcessed(eventId: string) {
+  try {
+    const response = await fetch(
+      `${supabaseClient.url}/rest/v1/stripe_webhook_events?stripe_event_id=eq.${eventId}`,
+      {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          "apikey": supabaseClient.key,
+          "Authorization": `Bearer ${supabaseClient.key}`,
+          "Prefer": "return=minimal"
+        },
+        body: JSON.stringify({ processed: true })
+      }
+    )
     if (!response.ok) {
       const errorText = await response.text()
-      console.warn("[stripe-webhook] ⚠️ Failed to store webhook event:", errorText)
-    } else {
-      console.log("[stripe-webhook] ✅ Webhook event stored")
+      console.warn("[stripe-webhook] ⚠️ Failed to mark event processed:", errorText)
     }
   } catch (error) {
-    console.warn("[stripe-webhook] ⚠️ Error storing webhook event:", error)
+    console.warn("[stripe-webhook] ⚠️ Error marking event processed:", error)
   }
 }
 
@@ -905,6 +980,25 @@ function getEmailSubject(type: string): string {
 }
 
 /**
+ * Get a short notification title from the notification type.
+ * The notifications table has a NOT NULL `title` column; every notification
+ * MUST supply one. Falls back to a generic title for unmapped types.
+ */
+function getNotificationTitle(type: string): string {
+  const titles: Record<string, string> = {
+    checkout_completed: "Checkout completed",
+    subscription_created: "Subscription active",
+    subscription_updated: "Subscription updated",
+    subscription_cancelled: "Subscription cancelled",
+    subscription_expired: "Subscription expired",
+    invoice_paid: "Invoice paid",
+    payment_succeeded: "Payment successful",
+    payment_failed: "Payment failed"
+  }
+  return titles[type] || "Notification"
+}
+
+/**
  * Create a notification for a user
  * @param {string} userId - User ID
  * @param {string} type - Notification type
@@ -936,25 +1030,32 @@ async function createNotification(
       metadata
     })
 
+    // The notifications table has a NOT NULL `title` column and does NOT have
+    // payment_id / subscription_id / invoice_id columns. Supply an explicit
+    // title (derived from the type) and fold any id references into the existing
+    // `data` JSONB column instead of writing nonexistent top-level columns.
+    const data: Record<string, unknown> = {}
+    if (metadata.payment_id) {
+      data.payment_id = metadata.payment_id
+      console.log("[stripe-webhook] Added payment_id to notification data:", metadata.payment_id)
+    }
+    if (metadata.subscription_id) {
+      data.subscription_id = metadata.subscription_id
+      console.log("[stripe-webhook] Added subscription_id to notification data:", metadata.subscription_id)
+    }
+    if (metadata.invoice_id) {
+      data.invoice_id = metadata.invoice_id
+      console.log("[stripe-webhook] Added invoice_id to notification data:", metadata.invoice_id)
+    }
+
     const notificationData: any = {
       user_id: userId,
       type: type,
       from_user_id: fromUserId,
+      title: getNotificationTitle(type),
       message: message,
+      data: data,
       read: false
-    }
-
-    if (metadata.payment_id) {
-      notificationData.payment_id = metadata.payment_id
-      console.log("[stripe-webhook] Added payment_id to notification:", metadata.payment_id)
-    }
-    if (metadata.subscription_id) {
-      notificationData.subscription_id = metadata.subscription_id
-      console.log("[stripe-webhook] Added subscription_id to notification:", metadata.subscription_id)
-    }
-    if (metadata.invoice_id) {
-      notificationData.invoice_id = metadata.invoice_id
-      console.log("[stripe-webhook] Added invoice_id to notification:", metadata.invoice_id)
     }
 
     console.log("[stripe-webhook] Sending notification to database:", {
