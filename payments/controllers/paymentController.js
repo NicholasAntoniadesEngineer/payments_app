@@ -185,7 +185,7 @@ const PaymentController = {
         const subscription = this.currentSubscription;
         const plan = this.currentPlan;
         
-        const planName = plan ? (plan.plan_name || 'Standard') : 'Standard';
+        const planName = plan ? (plan.name || plan.plan_name || 'Standard') : 'Standard';
         
         console.log('[PaymentController] Subscription data:', {
             status: subscription.status,

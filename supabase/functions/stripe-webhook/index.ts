@@ -67,6 +67,20 @@ const supabaseClient = {
   key: supabaseServiceKey,
 }
 
+// Format a money amount using the ACTUAL currency, not a hardcoded "$".
+// Falls back to the uppercased currency code for anything outside the symbol map.
+const CURRENCY_SYMBOLS: Record<string, string> = {
+  usd: "$",
+  gbp: "£",
+  eur: "€",
+}
+function formatAmount(amount: number, currency: string): string {
+  const code = (currency || "").toLowerCase()
+  const symbol = CURRENCY_SYMBOLS[code]
+  const value = amount.toFixed(2)
+  return symbol ? `${symbol}${value}` : `${value} ${code.toUpperCase()}`
+}
+
 serve(async (req) => {
   console.log("[stripe-webhook] ========== WEBHOOK REQUEST RECEIVED ==========")
   const startTime = Date.now()
@@ -187,18 +201,15 @@ serve(async (req) => {
       stack: error.stack,
       name: error.name
     })
-    
+
     return new Response(
-      JSON.stringify({ 
-        error: error.message || "Webhook processing failed",
-        details: error.toString(),
-      }),
-      { 
+      JSON.stringify({ error: "Webhook processing failed" }),
+      {
         status: 500,
-        headers: { 
+        headers: {
           "Content-Type": "application/json",
           "Access-Control-Allow-Origin": "*",
-        } 
+        }
       }
     )
   }
@@ -682,14 +693,14 @@ async function handleInvoicePaymentSucceeded(invoice: any) {
       userId,
       "invoice_paid",
       userId,
-      `Your invoice has been paid: $${amount.toFixed(2)} ${currency.toUpperCase()}.`,
+      `Your invoice has been paid: ${formatAmount(amount, currency)}.`,
       { payment_id: paymentId, subscription_id: userId, invoice_id: invoice.id }
     )
     await createNotification(
       userId,
       "payment_succeeded",
       userId,
-      `Your payment was successful: $${amount.toFixed(2)} ${currency.toUpperCase()}.`,
+      `Your payment was successful: ${formatAmount(amount, currency)}.`,
       { payment_id: paymentId, subscription_id: userId }
     )
 

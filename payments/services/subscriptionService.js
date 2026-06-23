@@ -505,7 +505,7 @@ const SubscriptionService = {
             
             // Calculate subscription tier
             // If downgrade is pending but not yet effective, use current plan tier (user keeps premium access)
-            const planName = plan?.plan_name || plan?.name || null;
+            const planName = plan?.name || plan?.plan_name || null;
             const status = subscription?.status || 'trial';
 
             // Check for pending downgrade

@@ -570,7 +570,7 @@ const StripeService = {
             };
             
             if (planId !== null) {
-                requestBody.planId = planId;
+                requestBody.newPlanId = planId;
             }
             if (changeType !== null) {
                 requestBody.changeType = changeType;

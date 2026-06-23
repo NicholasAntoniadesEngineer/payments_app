@@ -703,7 +703,7 @@ const UpgradeController = {
                         console.warn('[UpgradeController] Error syncing dates (non-critical):', syncError);
                     }
                     
-                    alert(`Downgrade scheduled! You will be moved to ${planName} at the end of your current billing period (${new Date(result.changeDate).toLocaleDateString()}). You will continue to have access to your current plan features until then.`);
+                    alert(`Downgrade scheduled! You will be moved to ${planName} at the end of your current billing period (${new Date(result.effective_at).toLocaleDateString()}). You will continue to have access to your current plan features until then.`);
                     
                     // Reload subscription and plans to refresh the display
                     await this.loadCurrentSubscription();
@@ -929,7 +929,7 @@ const UpgradeController = {
             });
             
             if (planResult.data && planResult.data.length > 0) {
-                planName = planResult.data[0].plan_name;
+                planName = planResult.data[0].name || planResult.data[0].plan_name;
                 console.log('[UpgradeController] Plan name for tier calculation:', planName);
             } else {
                 console.warn('[UpgradeController] Plan not found in database for plan ID:', planId);
@@ -1959,10 +1959,11 @@ const UpgradeController = {
             planNameType: typeof plan?.plan_name,
             willAdd: !!(plan && plan.plan_name)
         });
-        if (plan && plan.plan_name) {
-            const planHtml = `<div style="display: flex; justify-content: space-between; padding: var(--spacing-xs) 0; border-bottom: 1px solid var(--border-color, rgba(0,0,0,0.1));"><strong>Plan:</strong><span>${plan.plan_name}</span></div>`;
+        const planName = plan && (plan.name || plan.plan_name);
+        if (planName) {
+            const planHtml = `<div style="display: flex; justify-content: space-between; padding: var(--spacing-xs) 0; border-bottom: 1px solid var(--border-color, rgba(0,0,0,0.1));"><strong>Plan:</strong><span>${planName}</span></div>`;
             detailsHtml.push(planHtml);
-            console.log('[UpgradeController] ✅ Added Plan name:', plan.plan_name);
+            console.log('[UpgradeController] ✅ Added Plan name:', planName);
         } else {
             console.log('[UpgradeController] ⏭️ Skipping Plan name (plan:', plan, ', plan_name:', plan?.plan_name, ')');
         }
