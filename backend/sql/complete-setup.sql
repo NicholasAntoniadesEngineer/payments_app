@@ -1,3 +1,11 @@
+-- ============================================================
+-- payments_app — COMPLETE SUBSCRIPTION/PAYMENTS SCHEMA (run ONCE on a fresh database)
+-- Single self-contained file: extensions + plans/subscriptions/payments/payment_history.
+-- ============================================================
+-- Extensions (required on a fresh project; idempotent)
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
 -- ============================================================================
 -- Secure Messenger — SUBSCRIPTION SCHEMA (optional, additive)
 -- ============================================================================
