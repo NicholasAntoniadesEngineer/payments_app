@@ -491,19 +491,11 @@ const PaymentController = {
             }
             
             if (result.sessionId) {
-                // Store customer ID if returned (for future payment method updates)
-                if (result.customerId && window.SubscriptionService) {
-                    const currentUser = window.AuthService.getCurrentUser();
-                    if (currentUser && currentUser.id) {
-                        // Update subscription with customer ID (non-blocking)
-                        window.SubscriptionService.updateSubscription(currentUser.id, {
-                            stripe_customer_id: result.customerId
-                        }).catch(err => {
-                            console.warn('[PaymentController] Failed to store customer ID:', err);
-                        });
-                    }
-                }
-                
+                // PAY-3 / RLS-03: clients no longer write `subscriptions` (lockdown).
+                // checkout-session persists stripe_customer_id server-side (service role)
+                // and the Stripe webhook is authoritative — no client write needed here.
+                console.log('[PaymentController] stripe_customer_id persisted server-side by checkout-session/webhook');
+
                 const redirectResult = await window.StripeService.redirectToCheckout(result.sessionId);
                 if (!redirectResult.success) {
                     throw new Error(redirectResult.error || 'Failed to redirect to checkout');
@@ -627,21 +619,12 @@ const PaymentController = {
                 
                 customerId = customerResult.customerId;
                 console.log('[PaymentController] ✅ Customer created successfully:', customerId);
-                
-                // Store customer ID in database (non-blocking)
-                // If subscription exists, update it; otherwise it will be stored when subscription is created
-                if (window.SubscriptionService && this.currentSubscription) {
-                    console.log('[PaymentController] Step 8: Storing customer ID in database...');
-                    window.SubscriptionService.updateSubscription(currentUser.id, {
-                        stripe_customer_id: customerId
-                    }).then(() => {
-                        console.log('[PaymentController] ✅ Customer ID stored in database');
-                    }).catch(err => {
-                        console.warn('[PaymentController] ⚠️ Failed to store customer ID in database:', err);
-                    });
-                } else {
-                    console.log('[PaymentController] Step 8: Skipping database update (no subscription or SubscriptionService)');
-                }
+
+                // PAY-3 / RLS-03: clients can't write `subscriptions` after lockdown. The
+                // customerId is used directly for the portal session; create-customer /
+                // the Stripe webhook persist stripe_customer_id server-side. (OPERATOR NOTE:
+                // confirm the create-customer edge function persists it via service role.)
+                console.log('[PaymentController] Step 8: stripe_customer_id persisted server-side (not written by client)');
             } else {
                 console.log('[PaymentController] Step 7: Using existing customer ID:', customerId);
             }

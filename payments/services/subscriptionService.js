@@ -177,10 +177,17 @@ const SubscriptionService = {
     },
     
     /**
-     * Create a 30-day Premium trial subscription for a user
+     * Create a 30-day Premium trial subscription for the CURRENT user.
      * NOTE: This is normally handled by the database trigger on signup.
      * This function is a fallback for edge cases where the trigger didn't fire.
-     * @param {string} userId - User ID from Supabase
+     *
+     * SECURITY (PAY-3 / RLS-03): trial entitlement is server-authoritative. The client
+     * no longer writes the `subscriptions` row directly (that allowed self-granting
+     * Premium); it calls the SECURITY DEFINER `start_trial()` RPC, which re-asserts
+     * auth.uid() and refuses to re-grant a trial that was already used. The userId
+     * argument is ignored for the write — the server uses auth.uid() — and kept only
+     * for signature/back-compat with existing callers.
+     * @param {string} userId - (ignored for the write; server uses auth.uid())
      * @returns {Promise<{success: boolean, subscription: Object|null, error: string|null}>}
      */
     async createTrialSubscription(userId) {
@@ -189,56 +196,16 @@ const SubscriptionService = {
             if (!databaseService) {
                 throw new Error('DatabaseService not available');
             }
-
-            console.log('[SubscriptionService] Creating trial subscription for user:', userId);
-
-            // Get Premium plan from database (trial is for Premium features)
-            const tableName = this._getTableName('subscriptionPlans');
-            const planResult = await databaseService.querySelect(tableName, {
-                filter: { name: 'Premium' },
-                limit: 1
-            });
-
-            if (planResult.error || !planResult.data || planResult.data.length === 0) {
-                console.error('[SubscriptionService] Premium plan not found in database');
-                return {
-                    success: false,
-                    subscription: null,
-                    error: 'Premium plan not found in database'
-                };
+            if (typeof databaseService.queryRpc !== 'function') {
+                throw new Error('DatabaseService.queryRpc not available (host app must provide it)');
             }
 
-            const plan = planResult.data[0];
-            const trialPeriodDays = plan.trial_period_days || 30;
-            const now = new Date();
-            const trialEnd = new Date(now);
-            trialEnd.setDate(trialEnd.getDate() + trialPeriodDays);
+            console.log('[SubscriptionService] Starting trial via start_trial() RPC for current user');
 
-            // New optimal schema - much simpler!
-            const subscriptionData = {
-                user_id: userId,
-                plan_id: plan.id,
-                status: 'trial',
-                trial_end: trialEnd.toISOString(),
-                stripe_customer_id: null,
-                stripe_subscription_id: null,
-                stripe_price_id: null,
-                current_period_start: null,
-                current_period_end: null,
-                cancel_at_period_end: false,
-                canceled_at: null,
-                pending_plan_id: null,
-                pending_change_at: null
-            };
-
-            const subscriptionsTableName = this._getTableName('subscriptions');
-            const result = await databaseService.queryUpsert(subscriptionsTableName, subscriptionData, {
-                identifier: 'user_id',
-                identifierValue: userId
-            });
+            const result = await databaseService.queryRpc('start_trial', {});
 
             if (result.error) {
-                console.error('[SubscriptionService] Error creating trial subscription:', result.error);
+                console.error('[SubscriptionService] Error starting trial (RPC):', result.error);
                 return {
                     success: false,
                     subscription: null,
@@ -246,18 +213,26 @@ const SubscriptionService = {
                 };
             }
 
-            const subscription = result.data && result.data.length > 0 ? result.data[0] : null;
+            // start_trial() returns JSONB: { success, subscription } | { success:false, error }
+            const payload = result.data || {};
+            if (!payload.success) {
+                console.warn('[SubscriptionService] start_trial() refused:', payload.error);
+                return {
+                    success: false,
+                    subscription: null,
+                    error: payload.error || 'Failed to create trial subscription'
+                };
+            }
 
-            console.log('[SubscriptionService] Trial subscription created successfully:', {
-                userId: userId,
-                planId: plan.id,
-                planName: plan.name,
-                trialEnd: trialEnd.toISOString()
+            console.log('[SubscriptionService] Trial subscription ensured via RPC:', {
+                status: payload.subscription?.status,
+                planId: payload.subscription?.plan_id,
+                trialEnd: payload.subscription?.trial_end
             });
 
             return {
                 success: true,
-                subscription: subscription,
+                subscription: payload.subscription || null,
                 error: null
             };
         } catch (error) {
@@ -270,6 +245,64 @@ const SubscriptionService = {
         }
     },
     
+    /**
+     * Downgrade the CURRENT user's subscription to the Free plan (server-authoritative).
+     *
+     * SECURITY (PAY-3 / RLS-03): calls the SECURITY DEFINER downgrade_to_free() RPC,
+     * which scopes the write to auth.uid(), selects the Free plan, sets status='active'
+     * and clears all Stripe/trial/cancellation/pending fields. This does NOT cancel a
+     * live Stripe subscription — that remains the job of the update-subscription edge
+     * function (service role). Use this for trial-expiry auto-downgrade and cancel-to-Free.
+     * @returns {Promise<{success: boolean, subscription: Object|null, error: string|null}>}
+     */
+    async downgradeToFree() {
+        try {
+            const databaseService = this._getDatabaseService();
+            if (!databaseService) {
+                throw new Error('DatabaseService not available');
+            }
+            if (typeof databaseService.queryRpc !== 'function') {
+                throw new Error('DatabaseService.queryRpc not available (host app must provide it)');
+            }
+
+            console.log('[SubscriptionService] Downgrading to Free via downgrade_to_free() RPC');
+
+            const result = await databaseService.queryRpc('downgrade_to_free', {});
+
+            if (result.error) {
+                console.error('[SubscriptionService] Error downgrading to Free (RPC):', result.error);
+                return {
+                    success: false,
+                    subscription: null,
+                    error: result.error.message || 'Failed to downgrade to Free plan'
+                };
+            }
+
+            const payload = result.data || {};
+            if (!payload.success) {
+                console.warn('[SubscriptionService] downgrade_to_free() failed:', payload.error);
+                return {
+                    success: false,
+                    subscription: null,
+                    error: payload.error || 'Failed to downgrade to Free plan'
+                };
+            }
+
+            return {
+                success: true,
+                subscription: payload.subscription || null,
+                error: null
+            };
+        } catch (error) {
+            console.error('[SubscriptionService] Exception downgrading to Free:', error);
+            return {
+                success: false,
+                subscription: null,
+                error: error.message || 'An unexpected error occurred'
+            };
+        }
+    },
+
     /**
      * Get subscription for current user with plan details
      * Fetches subscription and related plan from database
@@ -404,41 +437,17 @@ const SubscriptionService = {
                     console.log('[SubscriptionService] Trial ended:', trialEndDate.toISOString());
                     console.log('[SubscriptionService] Current time:', now.toISOString());
 
-                    // Get Free plan ID
-                    const plansTableName = this._getTableName('subscriptionPlans');
-                    const freePlanResult = await databaseService.querySelect(plansTableName, {
-                        filter: { name: 'Free' },
-                        limit: 1
-                    });
+                    // SECURITY (PAY-3 / RLS-03): entitlement writes are server-authoritative.
+                    // Downgrade via the SECURITY DEFINER downgrade_to_free() RPC instead of a
+                    // direct subscriptions write. The server picks the Free plan + clears fields
+                    // and scopes the write to auth.uid().
+                    const downgradeResult = await this.downgradeToFree();
 
-                    if (freePlanResult.data && freePlanResult.data.length > 0) {
-                        const freePlan = freePlanResult.data[0];
-                        console.log('[SubscriptionService] Free plan found:', freePlan.id);
-
-                        // Downgrade to Free plan
-                        const downgradeResult = await this.updateSubscription(userId, {
-                            plan_id: freePlan.id,
-                            status: 'active',
-                            trial_end: null,
-                            stripe_customer_id: null,
-                            stripe_subscription_id: null,
-                            stripe_price_id: null,
-                            current_period_start: null,
-                            current_period_end: null,
-                            cancel_at_period_end: false,
-                            canceled_at: null,
-                            pending_plan_id: null,
-                            pending_change_at: null
-                        });
-
-                        if (downgradeResult.success) {
-                            console.log('[SubscriptionService] ✅ Successfully auto-downgraded to Free plan');
-                            subscription = downgradeResult.subscription;
-                        } else {
-                            console.error('[SubscriptionService] ❌ Failed to auto-downgrade:', downgradeResult.error);
-                        }
+                    if (downgradeResult.success) {
+                        console.log('[SubscriptionService] ✅ Successfully auto-downgraded to Free plan');
+                        subscription = downgradeResult.subscription || subscription;
                     } else {
-                        console.error('[SubscriptionService] ❌ Free plan not found in database');
+                        console.error('[SubscriptionService] ❌ Failed to auto-downgrade:', downgradeResult.error);
                     }
                 }
             }
@@ -570,102 +579,31 @@ const SubscriptionService = {
     },
     
     /**
-     * Update subscription status
-     * In the new schema, status field is the source of truth (synced from Stripe)
-     * @param {string} userId - User ID
-     * @param {Object} updateData - Data to update
-     * @returns {Promise<{success: boolean, subscription: Object|null, error: string|null}>}
+     * @deprecated REMOVED for PAY-3 / RLS-03 (server-authoritative entitlement).
+     *
+     * This used to do a direct client-side upsert into `subscriptions`, which let a
+     * user self-grant Premium (and breaks once INSERT/UPDATE on `subscriptions` is
+     * revoked from `authenticated`). All entitlement writes now flow through:
+     *   - start_trial()        RPC  -> SubscriptionService.createTrialSubscription()
+     *   - downgrade_to_free()  RPC  -> SubscriptionService.downgradeToFree()
+     *   - the Stripe edge functions / webhook (service role) for paid activation.
+     *
+     * It is intentionally a hard error so any remaining/stray caller is caught in
+     * review rather than silently failing with a 403 after the REVOKE lands.
+     * @param {string} userId
+     * @param {Object} updateData
+     * @returns {Promise<{success: boolean, subscription: null, error: string}>}
      */
     async updateSubscription(userId, updateData) {
-        try {
-            if (!window.DatabaseService) {
-                throw new Error('DatabaseService not available');
-            }
-
-            console.log('[SubscriptionService] updateSubscription - calling queryUpsert with:', {
-                userId: userId,
-                updateData: updateData,
-                identifier: 'user_id',
-                identifierValue: userId
-            });
-
-            const result = await window.DatabaseService.queryUpsert('subscriptions', {
-                user_id: userId,
-                ...updateData
-            }, {
-                identifier: 'user_id',
-                identifierValue: userId
-            });
-
-            console.log('[SubscriptionService] updateSubscription - queryUpsert result:', {
-                hasData: !!result.data,
-                dataLength: Array.isArray(result.data) ? result.data.length : 'N/A',
-                hasError: !!result.error,
-                errorMessage: result.error?.message
-            });
-
-            if (result.error) {
-                console.error('[SubscriptionService] Error updating subscription:', result.error);
-                console.error('[SubscriptionService] Error details:', {
-                    message: result.error.message,
-                    code: result.error.code,
-                    hint: result.error.hint,
-                    details: result.error.details
-                });
-                return {
-                    success: false,
-                    subscription: null,
-                    error: result.error.message || 'Failed to update subscription'
-                };
-            }
-
-            const subscription = result.data && result.data.length > 0 ? result.data[0] : null;
-
-            if (!subscription) {
-                console.warn('[SubscriptionService] updateSubscription - No subscription returned from queryUpsert');
-                // Try to fetch the subscription to verify it was updated
-                const databaseService = this._getDatabaseService();
-                const tableName = this._getTableName('subscriptions');
-                const fetchResult = await databaseService.querySelect(tableName, {
-                    filter: { user_id: userId },
-                    limit: 1
-                });
-
-                if (fetchResult.data && fetchResult.data.length > 0) {
-                    console.log('[SubscriptionService] updateSubscription - Subscription found via fetch:', fetchResult.data[0]);
-                    return {
-                        success: true,
-                        subscription: fetchResult.data[0],
-                        error: null
-                    };
-                } else {
-                    console.error('[SubscriptionService] updateSubscription - Subscription not found after update');
-                    return {
-                        success: false,
-                        subscription: null,
-                        error: 'Subscription not found after update'
-                    };
-                }
-            }
-
-            console.log('[SubscriptionService] ✅ Subscription updated successfully:', {
-                planId: subscription.plan_id,
-                status: subscription.status
-            });
-
-            return {
-                success: true,
-                subscription: subscription,
-                error: null
-            };
-        } catch (error) {
-            console.error('[SubscriptionService] Exception updating subscription:', error);
-            return {
-                success: false,
-                subscription: null,
-                error: error.message || 'An unexpected error occurred'
-            };
-        }
+        const msg = '[SubscriptionService] updateSubscription() is removed (PAY-3/RLS-03): ' +
+            'entitlement is server-authoritative. Use start_trial()/downgrade_to_free() RPCs ' +
+            'or the Stripe edge functions instead.';
+        console.error(msg, { userId, updateData });
+        return {
+            success: false,
+            subscription: null,
+            error: msg
+        };
     },
     
     /**

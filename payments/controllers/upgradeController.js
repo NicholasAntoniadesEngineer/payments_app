@@ -560,19 +560,11 @@ const UpgradeController = {
                     }
                 }
                 
-                // Update subscription directly to Free plan
-                // Clear Stripe fields since Free plan has no billing
-                const updateResult = await window.SubscriptionService.updateSubscription(currentUser.id, {
-                    plan_id: planId,
-                    status: 'active',  // Free plan is active (not trial)
-                    stripe_subscription_id: null, // Clear Stripe subscription ID
-                    stripe_customer_id: null, // Clear Stripe customer ID
-                    stripe_price_id: null, // Clear Stripe price ID
-                    current_period_start: null, // Clear billing period
-                    current_period_end: null,
-                    trial_end: null, // Clear trial end
-                    cancel_at_period_end: false
-                });
+                // Update subscription to Free plan via the server-authoritative
+                // downgrade_to_free() RPC (PAY-3 / RLS-03). The server selects the Free
+                // plan, sets status='active' and clears all Stripe/trial fields, scoped
+                // to auth.uid() — the client no longer writes entitlement columns directly.
+                const updateResult = await window.SubscriptionService.downgradeToFree();
                 
                 if (updateResult.success) {
                     alert(`Successfully switched to ${planName}!`);
@@ -813,20 +805,12 @@ const UpgradeController = {
             }
             
             if (result.sessionId || result.url) {
-                // Store customer ID if returned (non-blocking - webhook will also update this)
-                // Use a timeout to ensure redirect happens even if update is slow
-                if (result.customerId && window.SubscriptionService) {
-                    const customerIdUpdatePromise = window.SubscriptionService.updateSubscription(currentUser.id, {
-                        stripe_customer_id: result.customerId
-                    }).catch(err => {
-                        console.warn('[UpgradeController] Failed to store customer ID (non-critical - webhook will handle):', err.message || err);
-                    });
-                    
-                    // Don't wait for customer ID update - redirect immediately
-                    // The webhook will update the customer ID when checkout completes
-                    console.log('[UpgradeController] Customer ID update initiated (non-blocking)');
-                }
-                
+                // PAY-3 / RLS-03: the client no longer writes stripe_customer_id (clients
+                // can't write `subscriptions` after lockdown). checkout-session already
+                // persists the customer id server-side (service role) and the webhook is
+                // authoritative — nothing to do here but redirect.
+                console.log('[UpgradeController] Customer ID will be persisted server-side by checkout-session/webhook');
+
                 console.log('[UpgradeController] Redirecting to Stripe Checkout...');
                 
                 // If we have a direct URL (from fallback), use it
@@ -935,25 +919,52 @@ const UpgradeController = {
                 console.warn('[UpgradeController] Plan not found in database for plan ID:', planId);
             }
             
-            // Update subscription with new plan ID
-            console.log('[UpgradeController] Updating subscription with plan ID:', planId, 'plan name:', planName);
-            const updateResult = await window.SubscriptionService.updateSubscription(currentUser.id, {
-                plan_id: parseInt(planId),
-                status: 'active',  // Status will be synced from Stripe webhook
-                updated_at: new Date().toISOString()
-            });
-            
-            console.log('[UpgradeController] Update result:', {
+            // SECURITY (PAY-3 / RLS-03): do NOT self-flip the subscription to status='active'
+            // here. Visiting ?upgrade=success is attacker-controllable (the URL can be
+            // replayed without paying), so the client must never grant entitlement. The
+            // Stripe webhook (service role) is the sole authority that activates the paid
+            // plan after a real checkout.session.completed. We show "Activating…" and poll
+            // the read-only subscription view until the webhook lands.
+            console.log('[UpgradeController] Activating — waiting for Stripe webhook to confirm payment for plan ID:', planId);
+            this.showError('Activating your subscription… this can take a few seconds.');
+
+            // Poll the user's own (read-only) subscription until the webhook marks it active
+            // on the expected plan. No client write happens at any point.
+            const expectedPlanId = parseInt(planId);
+            let activated = null;
+            const maxActivationPolls = 8;      // ~16s total
+            const activationDelay = 2000;
+            for (let i = 0; i < maxActivationPolls; i++) {
+                const poll = await window.SubscriptionService.getCurrentUserSubscription();
+                const sub = poll && poll.success ? poll.subscription : null;
+                console.log('[UpgradeController] Activation poll', i + 1, '/', maxActivationPolls, ':', {
+                    status: sub?.status,
+                    planId: sub?.plan_id,
+                    hasStripeSub: !!sub?.stripe_subscription_id
+                });
+                if (sub && sub.status === 'active' && sub.plan_id === expectedPlanId && sub.stripe_subscription_id) {
+                    activated = sub;
+                    break;
+                }
+                await new Promise(resolve => setTimeout(resolve, activationDelay));
+            }
+
+            // Shape a result object compatible with the existing downstream logic.
+            const updateResult = activated
+                ? { success: true, subscription: activated, error: null }
+                : { success: false, subscription: null, error: 'Webhook activation not confirmed yet' };
+
+            console.log('[UpgradeController] Activation result:', {
                 success: updateResult.success,
                 hasSubscription: !!updateResult.subscription,
                 error: updateResult.error
             });
-            
+
             // Log tier information
             if (updateResult.success && updateResult.subscription) {
                 const tier = window.SubscriptionService.getSubscriptionTier(planName, 'paid');
-                console.log('[UpgradeController] ✅ Subscription updated with tier:', tier);
-                console.log('[UpgradeController] Updated subscription:', {
+                console.log('[UpgradeController] ✅ Subscription activated with tier:', tier);
+                console.log('[UpgradeController] Activated subscription:', {
                     planId: updateResult.subscription.plan_id,
                     planName: planName,
                     tier: tier,
@@ -1099,13 +1110,15 @@ const UpgradeController = {
                 await this.renderPlans();
                 this.displayCurrentSubscription();
             } else {
-                console.error('[UpgradeController] ❌ Failed to update subscription:', updateResult.error);
-                console.error('[UpgradeController] Error details:', {
-                    error: updateResult.error,
-                    hasSubscription: !!updateResult.subscription
-                });
-                // Still show success message - webhook will update it eventually
-                alert(`Subscription upgrade successful! Your new plan will be active shortly. If you don't see the update, please refresh the page.`);
+                console.warn('[UpgradeController] ⏳ Webhook activation not confirmed within the wait window:', updateResult.error);
+                // Payment may still be completing. The webhook (sole authority) will
+                // activate the plan once Stripe confirms; we do NOT grant it client-side.
+                alert(`Thanks! Your payment is being confirmed. Your new plan will activate automatically within a minute — please refresh the page if you don't see it.`);
+                // Refresh the display in case it activated right at the edge of the poll window.
+                await this.loadCurrentSubscription();
+                await this.loadAvailablePlans();
+                await this.renderPlans();
+                this.displayCurrentSubscription();
             }
             
             // Remove query params
@@ -1233,20 +1246,14 @@ const UpgradeController = {
                 
                 customerId = customerResult.customerId;
                 console.log('[UpgradeController] ✅ Customer created successfully:', customerId);
-                
-                // Store customer ID in database (non-blocking)
-                if (window.SubscriptionService && subscription) {
-                    console.log('[UpgradeController] Step 8: Storing customer ID in database...');
-                    window.SubscriptionService.updateSubscription(currentUser.id, {
-                        stripe_customer_id: customerId
-                    }).then(() => {
-                        console.log('[UpgradeController] ✅ Customer ID stored in database');
-                    }).catch(err => {
-                        console.warn('[UpgradeController] ⚠️ Failed to store customer ID in database:', err);
-                    });
-                } else {
-                    console.log('[UpgradeController] Step 8: Skipping database update (no subscription or SubscriptionService)');
-                }
+
+                // PAY-3 / RLS-03: clients can't write `subscriptions` after lockdown, so we
+                // no longer persist stripe_customer_id from the client. The customerId is
+                // used directly for the portal session below; the create-customer endpoint /
+                // Stripe webhook are responsible for persisting it server-side. (See runbook
+                // OPERATOR NOTE: confirm the create-customer edge function persists
+                // stripe_customer_id via the service role.)
+                console.log('[UpgradeController] Step 8: stripe_customer_id persisted server-side (not written by client)');
             } else {
                 console.log('[UpgradeController] Step 7: Using existing customer ID:', customerId);
             }
