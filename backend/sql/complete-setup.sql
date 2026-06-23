@@ -34,6 +34,11 @@ DROP FUNCTION IF EXISTS is_on_trial(TEXT, TIMESTAMPTZ) CASCADE;
 DROP FUNCTION IF EXISTS get_price_dollars(BIGINT) CASCADE;
 DROP FUNCTION IF EXISTS get_subscription_type(BIGINT, TEXT) CASCADE;
 DROP FUNCTION IF EXISTS is_recurring_billing_enabled(BOOLEAN) CASCADE;
+-- H-3: trial-expiry sweep. is_premium_active(UUID) is NOT dropped here — on the shared
+-- project the secure_db messages_insert_participant policy depends on it, so a CASCADE
+-- drop would tear down that policy. It is maintained via CREATE OR REPLACE below (stable
+-- signature + return type, so no DROP is needed).
+DROP FUNCTION IF EXISTS expire_overdue_trials() CASCADE;
 DROP TABLE IF EXISTS payment_history CASCADE;
 DROP TABLE IF EXISTS payments CASCADE;
 DROP TABLE IF EXISTS subscriptions CASCADE;
@@ -514,3 +519,109 @@ CREATE POLICY subscriptions_insert_own ON subscriptions
 -- AFTER the new client is deployed — see backend/sql/apply-entitlement-lockdown.sql.)
 REVOKE INSERT, UPDATE ON subscriptions FROM authenticated;
 REVOKE USAGE, SELECT ON SEQUENCE subscriptions_id_seq FROM authenticated;
+
+-- ============================================================
+-- SERVER-AUTHORITATIVE PREMIUM ENTITLEMENT PREDICATE (audit H-3)
+-- ============================================================
+-- The single source of truth for "is this user entitled to Premium RIGHT NOW".
+-- Computed from subscriptions + subscription_plans — NEVER from `status` alone:
+--   premium == (status='active' AND plan=Premium)
+--           OR (status='trial'  AND trial_end > NOW())
+-- An EXPIRED trial (trial_end <= NOW()) is treated as NOT premium here, so the gate
+-- is correct even BEFORE the pg_cron sweep below flips the stale row to Free. This
+-- closes the "keep Premium forever by never running the client downgrade" bypass:
+-- the only thing the client could skip was downgrade_to_free(); this predicate no
+-- longer trusts the un-swept `status='trial'`.
+--
+-- SECURITY DEFINER so the messages-INSERT RLS gate (secure_db) can evaluate it
+-- regardless of the subscriptions row's own RLS, and so it works for ANY caller path.
+-- It only ever reads ONE row (the passed uid) and returns a boolean — it leaks no
+-- other user's data. search_path is pinned. The caller (RLS WITH CHECK) always
+-- passes auth.uid(), so the answer is scoped to the acting user.
+CREATE OR REPLACE FUNCTION is_premium_active(p_uid UUID)
+RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+    SELECT EXISTS (
+        SELECT 1
+        FROM subscriptions s
+        JOIN subscription_plans p ON p.id = s.plan_id
+        WHERE s.user_id = p_uid
+          AND (
+                (s.status = 'active' AND p.name = 'Premium')
+             OR (s.status = 'trial'  AND s.trial_end IS NOT NULL AND s.trial_end > NOW())
+          )
+    );
+$$;
+
+-- Callable by authenticated users (the client also uses it to render entitlement
+-- truthfully) and by the messages-INSERT RLS gate. No write access.
+GRANT EXECUTE ON FUNCTION is_premium_active(UUID) TO authenticated;
+
+-- ============================================================
+-- TRIAL EXPIRY SWEEP (audit H-3) — server-side, NOT client-driven
+-- ============================================================
+-- Flip every expired trial to Free/active. This is the server replacement for the
+-- old client-only downgrade_to_free() path. is_premium_active() above already treats
+-- an expired trial as non-premium, so enforcement is correct even if this sweep has
+-- not yet run — but the sweep keeps the stored rows honest (and the UI accurate).
+-- Idempotent: only touches rows that are still status='trial' with a past trial_end.
+CREATE OR REPLACE FUNCTION expire_overdue_trials()
+RETURNS INTEGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_free_id BIGINT;
+    v_count   INTEGER;
+BEGIN
+    SELECT id INTO v_free_id FROM subscription_plans WHERE name = 'Free' LIMIT 1;
+    IF v_free_id IS NULL THEN
+        RAISE LOG 'expire_overdue_trials: Free plan not found; skipping';
+        RETURN 0;
+    END IF;
+
+    UPDATE subscriptions SET
+        plan_id   = v_free_id,
+        status    = 'active',
+        trial_end = NULL
+    WHERE status = 'trial'
+      AND trial_end IS NOT NULL
+      AND trial_end < NOW();
+
+    GET DIAGNOSTICS v_count = ROW_COUNT;
+    RETURN v_count;
+END;
+$$;
+
+-- The sweep runs as the service role (via pg_cron) — do NOT grant it to `authenticated`
+-- (a client must never be able to mass-mutate other users' subscription rows).
+REVOKE ALL ON FUNCTION expire_overdue_trials() FROM PUBLIC;
+
+-- Schedule the sweep hourly via pg_cron IF the extension is available. pg_cron is a
+-- superuser-installed extension; on Supabase enable it once in the Dashboard
+-- (Database > Extensions > pg_cron). If it is not present this block is a safe no-op
+-- and the DEPLOY note below documents enabling it. Even without the cron, the
+-- is_premium_active() predicate already denies expired trials, so revenue is protected.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_cron') THEN
+        -- cron.schedule is idempotent on the job NAME (newer pg_cron upserts; older
+        -- ones error on duplicate, which we swallow so re-running this file is safe).
+        BEGIN
+            PERFORM cron.schedule(
+                'expire-overdue-trials',
+                '0 * * * *',               -- top of every hour
+                $cron$SELECT public.expire_overdue_trials();$cron$
+            );
+        EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'pg_cron present but scheduling expire-overdue-trials failed (likely already scheduled): %', SQLERRM;
+        END;
+    ELSE
+        RAISE NOTICE 'pg_cron not installed: trial-expiry sweep NOT scheduled. is_premium_active() still denies expired trials. Enable pg_cron (Dashboard > Database > Extensions) then re-run this file or call cron.schedule manually.';
+    END IF;
+END $$;
