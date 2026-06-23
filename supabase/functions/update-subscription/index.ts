@@ -93,13 +93,28 @@ serve(async (req) => {
 
     // --- downgrade / cancel-at-period-end ---
     if (body.changeType === "downgrade") {
+      // M-4: validate newPlanId BEFORE it flows into Stripe metadata / pending_plan_id.
+      // Previously body.newPlanId was copied verbatim, so a tampered client could name
+      // ANY plan id; at period end handleSubscriptionDeleted would re-provision onto
+      // whatever that id priced (a latent tier/billing escalation once a 3rd plan
+      // exists). When a target plan is supplied we now require it to be a real,
+      // active, genuinely-cheaper plan than the caller's current one (a true
+      // downgrade). When NO newPlanId is supplied, this is a plain cancel-to-Free.
+      let validatedPlanId: number | null = null
+      if (body.newPlanId !== undefined && body.newPlanId !== null) {
+        validatedPlanId = await validateDowngradeTarget(supabase, body.newPlanId, sub.plan_id)
+        if (validatedPlanId === null) {
+          return json({ error: "Invalid downgrade plan" }, 400, cors)
+        }
+      }
+
       // Stop renewal; the user keeps Premium until current_period_end, then drops.
       // Tag the Stripe SUBSCRIPTION so the webhook applies the pending plan at period
-      // end instead of a plain cancellation. Gated on newPlanId so we never write the
-      // string 'undefined' for a cancel-to-Free with no target plan.
+      // end instead of a plain cancellation. Gated on the VALIDATED id so we never
+      // write the string 'undefined' (cancel-to-Free) or an unvalidated id.
       const stripeUpdate: Record<string, unknown> = { cancel_at_period_end: true }
-      if (body.newPlanId) {
-        stripeUpdate.metadata = { pendingPlanId: String(body.newPlanId), changeType: "downgrade" }
+      if (validatedPlanId !== null) {
+        stripeUpdate.metadata = { pendingPlanId: String(validatedPlanId), changeType: "downgrade" }
       }
       const s = await stripe.subscriptions.update(stripeSubId, stripeUpdate)
 
@@ -108,8 +123,8 @@ serve(async (req) => {
         current_period_end: new Date(s.current_period_end * 1000).toISOString(),
       }
       // Record the pending target plan (the stripe-webhook applies it at period end).
-      if (body.newPlanId) {
-        update.pending_plan_id = body.newPlanId
+      if (validatedPlanId !== null) {
+        update.pending_plan_id = validatedPlanId
         update.pending_change_at = new Date(s.current_period_end * 1000).toISOString()
       }
       await supabase.from("subscriptions").update(update).eq("user_id", user.id)
@@ -122,3 +137,53 @@ serve(async (req) => {
     return json({ error: "Failed to update subscription" }, 500, cors)
   }
 })
+
+/**
+ * M-4: validate a requested downgrade target plan id.
+ *
+ * Returns the validated integer plan id when ALL of the following hold; otherwise
+ * returns null (caller rejects):
+ *   - rawPlanId parses to a positive integer (no floats, no NaN, no negatives,
+ *     no "1; drop ..." strings),
+ *   - it is NOT the current plan (a no-op is not a downgrade),
+ *   - the target plan exists AND is_active,
+ *   - the target plan's price_cents is STRICTLY LESS than the current plan's
+ *     price_cents (a genuine downgrade — never an upgrade or a sidegrade).
+ *
+ * `supabase` is a service-role client (RLS-bypassing), used only to read the
+ * public subscription_plans catalog. Identity is already bound to the caller's
+ * own row upstream; this function never trusts a price/id from the request body.
+ */
+export async function validateDowngradeTarget(
+  supabase: any,
+  rawPlanId: unknown,
+  currentPlanId: number | null,
+): Promise<number | null> {
+  // Positive-integer check. Number(...) on a clean integer string/number only.
+  const n = typeof rawPlanId === "number" ? rawPlanId : Number(rawPlanId)
+  if (!Number.isInteger(n) || n <= 0) return null
+  // A downgrade to the current plan is a no-op, not a downgrade.
+  if (currentPlanId !== null && n === currentPlanId) return null
+
+  // Fetch BOTH the target and the current plan in one round-trip.
+  const ids = currentPlanId !== null ? [n, currentPlanId] : [n]
+  const { data: plans, error } = await supabase
+    .from("subscription_plans")
+    .select("id, price_cents, is_active")
+    .in("id", ids)
+  if (error || !Array.isArray(plans)) return null
+
+  const target = plans.find((p: any) => p.id === n)
+  if (!target || target.is_active !== true) return null
+  if (typeof target.price_cents !== "number") return null
+
+  // Compare against the caller's CURRENT plan price. If we can't resolve the
+  // current plan's price, fail closed (do not let an unvalidated comparison pass).
+  if (currentPlanId !== null) {
+    const current = plans.find((p: any) => p.id === currentPlanId)
+    if (!current || typeof current.price_cents !== "number") return null
+    if (!(target.price_cents < current.price_cents)) return null  // must be cheaper
+  }
+
+  return n
+}

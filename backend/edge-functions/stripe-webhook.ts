@@ -143,16 +143,27 @@ serve(async (req) => {
       created: new Date(event.created * 1000).toISOString()
     })
 
-    // Idempotency / event de-duplication (PAY-2/EB-02).
-    // The insert IS the lock: an atomic INSERT ... ON CONFLICT DO NOTHING records
-    // the event id BEFORE any handling. If the row already existed this is a
-    // redelivery of an event we have already seen, so we short-circuit with 200
-    // and skip reprocessing. NO SELECT-then-INSERT (that would be TOCTOU).
-    const inserted = await claimWebhookEvent(event)
-    if (!inserted) {
-      console.log("[stripe-webhook] ⏭️ Duplicate event, already seen — skipping:", event.id)
+    // Idempotency / event de-duplication (PAY-2/EB-02) — COMPLETION-based (M-3).
+    //
+    // The bug this fixes: the old code claimed the event on RECEIPT (INSERT ...
+    // ON CONFLICT DO NOTHING) and short-circuited 200 on ANY pre-existing row.
+    // A handler that then failed (it returned {success:false} as HTTP 200) or a
+    // crash after the claim INSERT committed left `processed=false` forever — and
+    // every Stripe redelivery saw the row and 200'd without ever running the
+    // handler. A dropped cancellation/payment-failure → user kept Premium.
+    //
+    // The fix: idempotency keys on COMPLETION, not receipt.
+    //   firstDelivery  -> our INSERT won the race: run the handler now.
+    //   alreadyProcessed (processed=true) -> short-circuit 200, do NOT re-run.
+    //   inFlight (row exists, processed=false) -> a prior delivery claimed it but
+    //       never finished (failure/crash). RE-RUN the (idempotent, PATCH-by-user)
+    //       handler. processed flips to true only on success below; on failure we
+    //       return 500 so Stripe keeps retrying.
+    const claim = await claimWebhookEvent(event)
+    if (claim === "alreadyProcessed") {
+      console.log("[stripe-webhook] ⏭️ Already processed — skipping:", event.id)
       return new Response(
-        JSON.stringify({ received: true, duplicate: true }),
+        JSON.stringify({ received: true, duplicate: true, status: "alreadyProcessed" }),
         {
           status: 200,
           headers: {
@@ -161,6 +172,10 @@ serve(async (req) => {
           }
         }
       )
+    }
+    if (claim === "inFlight") {
+      // Prior delivery claimed but did not complete — reprocess idempotently.
+      console.log("[stripe-webhook] 🔁 Prior delivery did not complete — reprocessing:", event.id)
     }
 
     // Handle different event types
@@ -196,8 +211,28 @@ serve(async (req) => {
         result = { success: true, message: `Unhandled event type: ${event.type}` }
     }
 
-    // Mark the event as fully processed (best-effort; idempotency already holds
-    // via the unique event id even if this flag never flips).
+    // M-3: completion-based idempotency. If the handler did NOT succeed, do NOT
+    // mark the event processed and return 500 so Stripe RETRIES (the claim row
+    // stays processed=false → the retry takes the inFlight/reprocess path above).
+    // Previously a handler failure was swallowed into HTTP 200, so Stripe never
+    // retried and the entitlement/cancellation write was lost permanently.
+    if (!result || result.success !== true) {
+      console.error("[stripe-webhook] ❌ Handler did not succeed — returning 500 for Stripe retry:", {
+        type: event.type, id: event.id, result
+      })
+      return new Response(
+        JSON.stringify({ received: false, error: "handler_failed", result }),
+        {
+          status: 500,
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+          }
+        }
+      )
+    }
+
+    // Success: NOW flip processed=true so future redeliveries short-circuit.
     await markWebhookEventProcessed(event.id)
 
     const totalElapsed = Date.now() - startTime
@@ -207,12 +242,12 @@ serve(async (req) => {
 
     return new Response(
       JSON.stringify({ received: true, result }),
-      { 
+      {
         status: 200,
-        headers: { 
+        headers: {
           "Content-Type": "application/json",
           "Access-Control-Allow-Origin": "*",
-        } 
+        }
       }
     )
   } catch (error) {
@@ -236,26 +271,35 @@ serve(async (req) => {
   }
 })
 
+type ClaimResult = "firstDelivery" | "alreadyProcessed" | "inFlight"
+
 /**
- * Atomically claim a webhook event for processing (idempotency lock).
+ * Claim a webhook event for processing — COMPLETION-based idempotency (M-3).
  *
- * Performs a single INSERT ... ON CONFLICT (stripe_event_id) DO NOTHING against
- * stripe_webhook_events. The INSERT itself is the lock — there is NO
- * SELECT-then-INSERT, so there is no TOCTOU window. PostgREST is told to ignore
- * duplicates and to return the representation; the response body therefore
- * contains the inserted row on a first delivery and an EMPTY array on a
- * redelivery whose id already exists.
+ * Step 1: atomic INSERT ... ON CONFLICT (stripe_event_id) DO NOTHING with
+ *         return=representation. The INSERT is the lock — NO SELECT-then-INSERT,
+ *         so there is no TOCTOU window on first delivery.
+ *           - a row came back  -> WE inserted it -> "firstDelivery".
+ *           - empty array / 409 -> the id already existed (a redelivery).
  *
- * Returns true  -> this call inserted the row (first time we've seen the event).
- * Returns false -> the id already existed (duplicate / redelivery) -> caller
- *                  should short-circuit with 200 and skip reprocessing.
+ * Step 2 (only on conflict): SELECT the existing row's `processed` flag to decide
+ *         what kind of redelivery this is:
+ *           - processed = true  -> "alreadyProcessed": the handler completed on a
+ *                                  prior delivery; caller short-circuits 200.
+ *           - processed = false -> "inFlight": a prior delivery claimed the event
+ *                                  but never finished (handler failure / crash);
+ *                                  caller RE-RUNS the idempotent handler.
+ *
+ * This replaces the old receipt-based logic that returned a bare boolean and made
+ * ANY pre-existing row short-circuit 200 — which permanently dropped events whose
+ * first delivery claimed the row but failed before flipping `processed`.
  *
  * Minimal columns only (no payload/PII). On a genuine DB error we throw so the
  * outer try/catch returns 500 and Stripe retries — we never blanket-convert a
- * 500 into a 200, only true duplicates short-circuit.
+ * 500 into a 200.
  */
-async function claimWebhookEvent(event: any): Promise<boolean> {
-  console.log("[stripe-webhook] Claiming webhook event (idempotency insert)...")
+async function claimWebhookEvent(event: any): Promise<ClaimResult> {
+  console.log("[stripe-webhook] Claiming webhook event (completion-based idempotency)...")
 
   const response = await fetch(`${supabaseClient.url}/rest/v1/stripe_webhook_events`, {
     method: "POST",
@@ -274,26 +318,60 @@ async function claimWebhookEvent(event: any): Promise<boolean> {
     })
   })
 
-  // A 409 also means "already present" on some PostgREST configurations; treat
-  // it as a duplicate rather than an error.
-  if (response.status === 409) {
-    console.log("[stripe-webhook] Event already present (409) — duplicate")
-    return false
+  // 409 (some PostgREST configs) also means "already present" — fall through to
+  // the processed-flag lookup rather than treating it as success or error.
+  if (response.status !== 409) {
+    if (!response.ok) {
+      const errorText = await response.text()
+      // Genuine failure (e.g. table missing) — do NOT swallow. Throw so the outer
+      // handler returns 500 and Stripe retries.
+      throw new Error(`Failed to claim webhook event: ${response.status} ${errorText}`)
+    }
+    const rows = await response.json().catch(() => [])
+    if (Array.isArray(rows) && rows.length > 0) {
+      console.log("[stripe-webhook] ✅ Event claimed (first delivery)")
+      return "firstDelivery"
+    }
+  } else {
+    console.log("[stripe-webhook] Event already present (409) — checking processed flag")
   }
+
+  // Conflict: the event id already exists. Read its processed flag to decide
+  // whether the prior delivery actually completed.
+  return await readClaimState(event.id)
+}
+
+/**
+ * Read the completion state of an already-claimed event (M-3 helper).
+ * Returns "alreadyProcessed" if processed=true, else "inFlight". A missing row
+ * (lost the insert race AND the row vanished) is treated as inFlight so we err
+ * toward reprocessing the idempotent handler rather than dropping the event.
+ */
+async function readClaimState(eventId: string): Promise<ClaimResult> {
+  const response = await fetch(
+    `${supabaseClient.url}/rest/v1/stripe_webhook_events?stripe_event_id=eq.${eventId}&select=processed`,
+    {
+      method: "GET",
+      headers: {
+        "apikey": supabaseClient.key,
+        "Authorization": `Bearer ${supabaseClient.key}`,
+      }
+    }
+  )
 
   if (!response.ok) {
     const errorText = await response.text()
-    // Genuine failure (e.g. table missing) — do NOT swallow. Throw so the outer
-    // handler returns 500 and Stripe retries. (Replaces the old 404-swallowing.)
-    throw new Error(`Failed to claim webhook event: ${response.status} ${errorText}`)
+    // Cannot determine state — throw so the outer handler returns 500 and Stripe
+    // retries (never silently drop).
+    throw new Error(`Failed to read webhook event state: ${response.status} ${errorText}`)
   }
 
   const rows = await response.json().catch(() => [])
-  const insertedNow = Array.isArray(rows) && rows.length > 0
-  console.log(insertedNow
-    ? "[stripe-webhook] ✅ Event claimed (first delivery)"
-    : "[stripe-webhook] Event already present (no row inserted) — duplicate")
-  return insertedNow
+  const processed = Array.isArray(rows) && rows.length > 0 ? rows[0].processed === true : false
+  console.log(processed
+    ? "[stripe-webhook] Event already processed — will short-circuit"
+    : "[stripe-webhook] Event claimed but not processed (inFlight) — will reprocess")
+  return processed ? "alreadyProcessed" : "inFlight"
 }
 
 /**
@@ -604,9 +682,18 @@ async function handleSubscriptionDeleted(subscription: any) {
     if (isScheduledDowngrade) {
       // This was a scheduled downgrade - create new subscription with lower tier
       console.log("[stripe-webhook] Processing scheduled downgrade...")
-      
-      // Get plan details from database
-      const planResponse = await fetch(`${supabaseClient.url}/rest/v1/subscription_plans?id=eq.${pendingPlanId}&select=*`, {
+
+      // M-4: re-validate the pending plan id at provisioning time. The id rode in
+      // through Stripe metadata; treat it as untrusted here too (defense in depth —
+      // even though update-subscription now validates on write). Require a positive
+      // integer id.
+      const pendingPlanIdInt = Number(pendingPlanId)
+      if (!Number.isInteger(pendingPlanIdInt) || pendingPlanIdInt <= 0) {
+        console.warn("[stripe-webhook] ⚠️ Invalid pendingPlanId, falling through to cancellation:", pendingPlanId)
+      } else {
+      // Get plan details from database (target + the user's CURRENT plan for the
+      // downgrade-legitimacy check).
+      const planResponse = await fetch(`${supabaseClient.url}/rest/v1/subscription_plans?id=eq.${pendingPlanIdInt}&select=*`, {
         method: "GET",
         headers: {
           "Content-Type": "application/json",
@@ -615,11 +702,51 @@ async function handleSubscriptionDeleted(subscription: any) {
         },
       })
 
+      // Resolve the user's CURRENT plan so we can assert the target is genuinely
+      // cheaper (a real downgrade) and not an escalation slipped in via metadata.
+      const currentSubResponse = await fetch(`${supabaseClient.url}/rest/v1/subscriptions?user_id=eq.${userId}&select=plan_id`, {
+        method: "GET",
+        headers: {
+          "apikey": supabaseClient.key,
+          "Authorization": `Bearer ${supabaseClient.key}`,
+        },
+      })
+      let currentPlan: any = null
+      if (currentSubResponse.ok) {
+        const subs = await currentSubResponse.json()
+        const currentPlanId = subs?.[0]?.plan_id
+        if (currentPlanId) {
+          const curPlanResp = await fetch(`${supabaseClient.url}/rest/v1/subscription_plans?id=eq.${currentPlanId}&select=*`, {
+            method: "GET",
+            headers: {
+              "apikey": supabaseClient.key,
+              "Authorization": `Bearer ${supabaseClient.key}`,
+            },
+          })
+          if (curPlanResp.ok) {
+            const curPlans = await curPlanResp.json()
+            currentPlan = curPlans && curPlans.length > 0 ? curPlans[0] : null
+          }
+        }
+      }
+
       if (planResponse.ok) {
         const plans = await planResponse.json()
         const newPlan = plans && plans.length > 0 ? plans[0] : null
 
-        if (newPlan && newPlan.stripe_price_id) {
+        // M-4: only provision when the target is active, has a Stripe price, and is
+        // a TRUE downgrade (strictly cheaper than the current plan). Anything else
+        // falls through to a plain cancellation rather than re-provisioning onto a
+        // pricier/inactive/mis-priced plan.
+        const isLegitDowngrade = !!newPlan
+          && newPlan.is_active === true
+          && !!newPlan.stripe_price_id
+          && typeof newPlan.price_cents === "number"
+          && (!currentPlan
+              || (typeof currentPlan.price_cents === "number"
+                  && newPlan.price_cents < currentPlan.price_cents))
+
+        if (isLegitDowngrade) {
           // Create new subscription with downgraded plan
           const newSubscription = await stripe.subscriptions.create({
             customer: customerId,
@@ -665,9 +792,10 @@ async function handleSubscriptionDeleted(subscription: any) {
           console.log("[stripe-webhook] ✅ Downgrade completed, new subscription active")
           return { success: true, message: "Scheduled downgrade completed" }
         } else {
-          console.warn("[stripe-webhook] ⚠️ Plan not found or missing Stripe Price ID, marking as cancelled")
+          console.warn("[stripe-webhook] ⚠️ Pending plan invalid (inactive, missing Stripe price, or not a true downgrade), marking as cancelled")
         }
       }
+      } // end M-4 positive-integer guard (else branch)
     }
 
     // Regular cancellation (not a scheduled downgrade)
