@@ -417,8 +417,10 @@ const PaymentController = {
                 day: 'numeric'
             });
             
-            const amount = (payment.amount / 100).toFixed(2);
-            const currency = payment.currency.toUpperCase();
+            // payment_history.amount is stored in MAJOR units (dollars), matching what
+            // the webhook writes (Stripe cents / 100) — render directly, do NOT /100 again.
+            const amount = Number(payment.amount).toFixed(2);
+            const currency = (payment.currency || 'usd').toUpperCase();
             
             let statusClass = 'payment-status-pending';
             if (payment.status === 'succeeded') {

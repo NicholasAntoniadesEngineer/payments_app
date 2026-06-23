@@ -26,6 +26,7 @@ DROP FUNCTION IF EXISTS is_on_trial(TEXT, TIMESTAMPTZ) CASCADE;
 DROP FUNCTION IF EXISTS get_price_dollars(BIGINT) CASCADE;
 DROP FUNCTION IF EXISTS get_subscription_type(BIGINT, TEXT) CASCADE;
 DROP FUNCTION IF EXISTS is_recurring_billing_enabled(BOOLEAN) CASCADE;
+DROP TABLE IF EXISTS payment_history CASCADE;
 DROP TABLE IF EXISTS payments CASCADE;
 DROP TABLE IF EXISTS subscriptions CASCADE;
 DROP TABLE IF EXISTS subscription_plans CASCADE;
@@ -138,6 +139,50 @@ CREATE POLICY payments_select_own ON payments
 
 GRANT SELECT ON payments TO authenticated;
 GRANT USAGE, SELECT ON SEQUENCE payments_id_seq TO authenticated;
+
+-- ============================================================
+-- PAYMENT HISTORY (written by the stripe-webhook edge function)
+-- ============================================================
+-- The stripe-webhook records every invoice payment here via the service role
+-- (recordPayment() in edge-functions/stripe-webhook.ts). The subscription UI
+-- reads it back (PaymentService.getPaymentHistory + renderPaymentHistory) and
+-- the webhook re-reads it by (user_id, stripe_invoice_id) to attach the new
+-- payment id to its notifications. The legacy `payments` table above lacks
+-- stripe_invoice_id, so this separate table is required for those read-backs.
+-- NOTE: amount is stored in MAJOR units (dollars/euros). The webhook divides
+-- Stripe's integer cents by 100 before writing (e.g. invoice.amount_paid / 100).
+CREATE TABLE IF NOT EXISTS payment_history (
+    id BIGSERIAL PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    subscription_id UUID,  -- webhook writes the user_id here ("user_id is the subscription_id in our schema")
+    stripe_payment_intent_id TEXT,
+    stripe_charge_id TEXT,
+    stripe_invoice_id TEXT,
+    amount NUMERIC(12, 2) NOT NULL DEFAULT 0,  -- major units (dollars/euros), NOT cents
+    currency TEXT NOT NULL DEFAULT 'usd',
+    status TEXT NOT NULL,
+    payment_method TEXT,
+    payment_date TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    refunded_amount NUMERIC(12, 2) DEFAULT 0,
+    refunded_date TIMESTAMPTZ,
+    metadata JSONB DEFAULT '{}',
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Read-back path: webhook filters by (user_id, stripe_invoice_id); UI filters by user_id.
+CREATE INDEX IF NOT EXISTS idx_payment_history_user_invoice
+    ON payment_history(user_id, stripe_invoice_id);
+
+ALTER TABLE payment_history ENABLE ROW LEVEL SECURITY;
+
+-- The subscription UI reads a user's own payment history.
+CREATE POLICY payment_history_select_own ON payment_history
+    FOR SELECT USING (auth.uid() = user_id);
+
+-- Writes are performed by the stripe-webhook with the service role (which
+-- bypasses RLS), so authenticated users get SELECT only — never INSERT/UPDATE.
+GRANT SELECT ON payment_history TO authenticated;
+GRANT USAGE, SELECT ON SEQUENCE payment_history_id_seq TO authenticated;
 
 -- Populate subscription plans (rebranded for Secure Messenger).
 -- Set stripe_price_id to your real Stripe price IDs to enable paid upgrades.
